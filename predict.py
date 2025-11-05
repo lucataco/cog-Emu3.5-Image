@@ -12,6 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from cog import BasePredictor, Input, Path as CogPath
 from typing import Dict, Iterable, List, Optional, Tuple
+from huggingface_hub import snapshot_download
 
 MODEL_PATH = "checkpoints"
 CODE_REPO_URL = "https://github.com/baaivision/Emu3.5"
@@ -51,6 +52,7 @@ class Predictor(BasePredictor):
 
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.set_float32_matmul_precision("high")
+        torch.backends.cudnn.benchmark = True  # Enable cudnn autotuner for A100/H100
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -93,6 +95,33 @@ class Predictor(BasePredictor):
         )
 
         self.model.eval()
+
+        # Enable inference optimizations for A100/H100
+        # Note: torch.compile on the main model causes excessive recompilations with Flash Attention
+        # and dynamic generation, making inference slower. The model already uses Flash Attention 2.
+        torch.set_grad_enabled(False)  # Ensure gradients are disabled
+
+        # Optimize memory allocation for faster inference
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            # Use memory efficient attention patterns
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+            torch.backends.cuda.enable_flash_sdp(True)
+            torch.backends.cuda.enable_math_sdp(False)  # Slower fallback
+
+        # Compile VQ decoder for faster image decoding (static graph, works well)
+        print("Compiling VQ decoder for faster image generation...")
+        if hasattr(self.vq_model, 'decoder'):
+            try:
+                self.vq_model.decoder = torch.compile(
+                    self.vq_model.decoder,
+                    mode="max-autotune",  # Decoder has static graph, use aggressive optimization
+                    fullgraph=True,
+                )
+                print("VQ decoder compiled successfully")
+            except Exception as e:
+                print(f"Warning: Could not compile VQ decoder: {e}")
+                print("Continuing with uncompiled decoder...")
 
         self.special_tokens = {
             "BOS": "<|extra_203|>",
@@ -263,58 +292,60 @@ class Predictor(BasePredictor):
         np.random.seed(seed)
         random.seed(seed)
 
-        unc_prompt = cfg.unc_prompt
-        prompt_text = cfg.template.format(question=prompt)
+        # Use inference_mode for faster execution (disables autograd tracking)
+        with torch.inference_mode():
+            unc_prompt = cfg.unc_prompt
+            prompt_text = cfg.template.format(question=prompt)
 
-        if use_image:
-            image_path = Path(reference_image)
-            pil_image = Image.open(image_path).convert("RGB")
-            image_tokens = self._build_image(pil_image, cfg, self.tokenizer, self.vq_model)
-            prompt_text = prompt_text.replace("<|IMAGE|>", image_tokens)
-            unc_prompt = unc_prompt.replace("<|IMAGE|>", image_tokens)
+            if use_image:
+                image_path = Path(reference_image)
+                pil_image = Image.open(image_path).convert("RGB")
+                image_tokens = self._build_image(pil_image, cfg, self.tokenizer, self.vq_model)
+                prompt_text = prompt_text.replace("<|IMAGE|>", image_tokens)
+                unc_prompt = unc_prompt.replace("<|IMAGE|>", image_tokens)
 
-        input_ids = self.tokenizer.encode(
-            prompt_text,
-            return_tensors="pt",
-            add_special_tokens=False,
-        ).to(self.model.device)
+            input_ids = self.tokenizer.encode(
+                prompt_text,
+                return_tensors="pt",
+                add_special_tokens=False,
+            ).to(self.model.device)
 
-        if input_ids[0, 0] != cfg.special_token_ids["BOS"]:
-            bos = torch.tensor([[cfg.special_token_ids["BOS"]]], device=input_ids.device)
-            input_ids = torch.cat([bos, input_ids], dim=1)
+            if input_ids[0, 0] != cfg.special_token_ids["BOS"]:
+                bos = torch.tensor([[cfg.special_token_ids["BOS"]]], device=input_ids.device)
+                input_ids = torch.cat([bos, input_ids], dim=1)
 
-        unconditional_ids = self.tokenizer.encode(
-            unc_prompt,
-            return_tensors="pt",
-            add_special_tokens=False,
-        ).to(self.model.device)
+            unconditional_ids = self.tokenizer.encode(
+                unc_prompt,
+                return_tensors="pt",
+                add_special_tokens=False,
+            ).to(self.model.device)
 
-        generation_iter = self._generate(
-            cfg=cfg,
-            model=self.model,
-            tokenizer=self.tokenizer,
-            input_ids=input_ids,
-            unconditional_ids=unconditional_ids,
-            full_unconditional_ids=None,
-        )
+            generation_iter = self._generate(
+                cfg=cfg,
+                model=self.model,
+                tokenizer=self.tokenizer,
+                input_ids=input_ids,
+                unconditional_ids=unconditional_ids,
+                full_unconditional_ids=None,
+            )
 
-        try:
-            generated_tokens = next(generation_iter)
-        except StopIteration as exc:  # pragma: no cover - defensive
-            raise RuntimeError("Generation did not yield any tokens.") from exc
+            try:
+                generated_tokens = next(generation_iter)
+            except StopIteration as exc:  # pragma: no cover - defensive
+                raise RuntimeError("Generation did not yield any tokens.") from exc
 
-        for _ in generation_iter:  # exhaust remaining yields if any
-            pass
+            for _ in generation_iter:  # exhaust remaining yields if any
+                pass
 
-        if isinstance(generated_tokens, torch.Tensor):
-            tokens_sequence = generated_tokens.detach().cpu().tolist()
-        elif isinstance(generated_tokens, np.ndarray):
-            tokens_sequence = generated_tokens.tolist()
-        else:
-            tokens_sequence = list(generated_tokens)
+            if isinstance(generated_tokens, torch.Tensor):
+                tokens_sequence = generated_tokens.detach().cpu().tolist()
+            elif isinstance(generated_tokens, np.ndarray):
+                tokens_sequence = generated_tokens.tolist()
+            else:
+                tokens_sequence = list(generated_tokens)
 
-        decoded = self.tokenizer.decode(tokens_sequence, skip_special_tokens=False)
-        multimodal_output = self._multimodal_decode(decoded, self.tokenizer, self.vq_model)
+            decoded = self.tokenizer.decode(tokens_sequence, skip_special_tokens=False)
+            multimodal_output = self._multimodal_decode(decoded, self.tokenizer, self.vq_model)
 
         images, texts = self._split_outputs(multimodal_output)
 
