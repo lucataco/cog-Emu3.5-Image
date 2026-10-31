@@ -58,8 +58,8 @@ The first invocation can take several minutes while ~34B parameter weights downl
 - Dependencies: `flash_attn` is installed inside the container; if build fails, switch `attn_implementation` to `eager` inside `predict.py`.
 - Weights live in `checkpoints/` so Cog caches persist between runs; delete the folder to force a fresh download.
 
-## Licensing
+## License
 
-- Model weights: Apache-2.0 (per Hugging Face model card) [[1]](https://huggingface.co/BAAI/Emu3.5-Image).
-- Code in this wrapper: inherits this repository’s license.
+The code in this repository is licensed under the [Apache License 2.0](LICENSE).
 
+The model weights are not covered by this license. [BAAI/Emu3.5-Image](https://huggingface.co/BAAI/Emu3.5-Image) is released under the [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0) license.
